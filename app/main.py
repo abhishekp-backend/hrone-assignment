@@ -36,6 +36,12 @@ def create_indexes():
         name="uq_employees_emp_code",
     )
 
+    db.employees.create_index(
+        [("email", 1)],
+        unique=True,
+        name="uq_employees_email"
+    )
+
     # Employees: department filtering and employee-code ordering
     db.employees.create_index(
         [("department", 1), ("emp_code", 1)],
@@ -144,15 +150,29 @@ def health():
     return {"status": "ok"}
 
 
+
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}) is not None:
-        raise HTTPException(409, "emp_code already exists")
+    if db.employees.find_one({"emp_code": body.emp_code}):
+        raise HTTPException(
+            status_code=409,
+            detail="Employee code already exists"
+        )
+
+    if db.employees.find_one({"email": body.email}):
+        raise HTTPException(
+            status_code=409,
+            detail="Email already exists"
+        )
+
     doc = body.model_dump()
     doc["created_at"] = datetime.now(timezone.utc)
-    db.employees.insert_one(doc)
+
+    result = db.employees.insert_one(doc)
+
     doc.pop("_id", None)
     return doc
+
 
 
 @app.get("/employees")
@@ -676,6 +696,329 @@ def get_attendance_history(emp_code: str, date: str):
         "date": record["date"],
         "history": record.get("history", [])
     }
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: str):
+    # 1. Validate the requested date
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="date must be in YYYY-MM-DD format"
+        )
+
+    # 2. Find that day's attendance record
+    record = db.attendance_logs.find_one({
+        "emp_code": emp_code,
+        "date": date
+    })
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Attendance record not found"
+        )
+
+    # 3. Find the employee's scheduled shift
+    employee = db.employees.find_one({"emp_code": emp_code})
+
+    if employee is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    punch_in = record.get("punch_in")
+    punch_out = record.get("punch_out")
+
+    if not punch_in or not punch_out:
+        raise HTTPException(
+            status_code=400,
+            detail="Both punch-in and punch-out are required"
+        )
+
+    def parse_timestamp(value):
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+
+        if parsed.tzinfo is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Punch timestamps must include a timezone"
+            )
+
+        return parsed.astimezone(timezone.utc)
+
+    punch_in_time = parse_timestamp(punch_in)
+    punch_out_time = parse_timestamp(punch_out)
+
+    if punch_out_time < punch_in_time:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be before punch-in"
+        )
+
+    # 4. Recompute derived fields
+    work_hours = round(
+        (punch_out_time - punch_in_time).total_seconds() / 3600,
+        2
+    )
+
+    # Use the same timezone as the rest of your application.
+    # This assumes IST is already defined in your code.
+    local_in = punch_in_time.astimezone(IST)
+    attendance_day = datetime.strptime(date, "%Y-%m-%d").date()
+
+    shift_start = datetime.combine(
+        attendance_day,
+        time.fromisoformat(employee["shift_start"].zfill(5)),
+        tzinfo=IST
+    )
+
+    shift_end = datetime.combine(
+        attendance_day,
+        time.fromisoformat(employee["shift_end"].zfill(5)),
+        tzinfo=IST
+    )
+
+    if shift_end <= shift_start:
+        shift_end += timedelta(days=1)
+
+    # If the employee punched in after midnight for an overnight shift,
+    # adjust the scheduled shift to the preceding day.
+    if local_in.date() > attendance_day:
+        shift_start -= timedelta(days=1)
+        shift_end -= timedelta(days=1)
+
+    late_minutes = max(
+        0,
+        int((local_in - shift_start).total_seconds() // 60)
+    )
+
+    overtime_minutes = max(
+        0,
+        int((
+                    punch_out_time - shift_end.astimezone(timezone.utc)
+            ).total_seconds() // 60)
+    )
+
+    half_day = work_hours < 4
+
+    if half_day:
+        status = "half_day"
+    elif late_minutes > 0:
+        status = "late"
+    else:
+        status = "present"
+
+    # 5. Record before/after values for the audit history
+    fields = {
+        "work_hours": work_hours,
+        "late_minutes": late_minutes,
+        "overtime_minutes": overtime_minutes,
+        "half_day": half_day,
+        "status": status
+    }
+
+    changes = {}
+    for field, new_value in fields.items():
+        old_value = record.get(field)
+        if old_value != new_value:
+            changes[field] = {
+                "before": old_value,
+                "after": new_value
+            }
+
+    history_entry = {
+        "action": "regularize",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "changes": changes
+    }
+
+    # 6. Update the record and append to existing history atomically
+    db.attendance_logs.update_one(
+        {"_id": record["_id"]},
+        {
+            "$set": fields,
+            "$push": {"history": history_entry}
+        }
+    )
+
+    # 7. Return the updated document
+    updated = db.attendance_logs.find_one(
+        {"_id": record["_id"]},
+        {"_id": 0}
+    )
+
+    return updated
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly_summary(emp_code: str, month: str):
+    # 1. Validate month format
+    try:
+        month_start = datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="month must be in YYYY-MM format"
+        )
+
+    if month_start.strftime("%Y-%m") != month:
+        raise HTTPException(
+            status_code=422,
+            detail="month must be in YYYY-MM format"
+        )
+
+    # 2. Check that the employee exists
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0, "emp_code": 1, "name": 1, "department": 1}
+    )
+
+    if employee is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    # 3. Define the month range
+    next_month = (
+            month_start.replace(day=28) + timedelta(days=4)
+    ).replace(day=1)
+
+    start_date = month_start.strftime("%Y-%m-%d")
+    end_date = next_month.strftime("%Y-%m-%d")
+
+    # 4. Aggregate attendance records in MongoDB
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {
+                    "$gte": start_date,
+                    "$lt": end_date
+                }
+            }
+        },
+        {
+            "$set": {
+                "_day_of_week": {
+                    "$dayOfWeek": {
+                        "$dateFromString": {
+                            "dateString": "$date",
+                            "format": "%Y-%m-%d"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+
+                "attendance_records": {
+                    "$sum": 1
+                },
+
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {
+                                        "$in": [
+                                            "$status",
+                                            [
+                                                "PRESENT",
+                                                "WFH",
+                                                "ON_DUTY"
+                                            ]
+                                        ]
+                                    },
+                                    {
+                                        "$gte": ["$_day_of_week", 2]
+                                    },
+                                    {
+                                        "$lte": ["$_day_of_week", 6]
+                                    }
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": ["$half_day", True]},
+                                    0.5,
+                                    1
+                                ]
+                            },
+                            0
+                        ]
+                    }
+                },
+
+                "total_work_hours": {
+                    "$sum": {
+                        "$ifNull": ["$work_hours", 0]
+                    }
+                },
+
+                "average_work_hours": {
+                    "$avg": "$work_hours"
+                },
+
+                "total_late_minutes": {
+                    "$sum": {
+                        "$ifNull": ["$late_minutes", 0]
+                    }
+                },
+
+                "total_overtime_minutes": {
+                    "$sum": {
+                        "$ifNull": ["$overtime_minutes", 0]
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "attendance_records": 1,
+                "present_days": 1,
+                "total_work_hours": {"$round": ["$total_work_hours", 2]},
+                "average_work_hours": {
+                    "$round": ["$average_work_hours", 2]
+                },
+                "total_late_minutes": 1,
+                "total_overtime_minutes": 1
+            }
+        }
+    ]
+
+    result = list(db.attendance_logs.aggregate(pipeline))
+
+    # 5. Return zero totals if no attendance records exist
+    summary = result[0] if result else {
+        "attendance_records": 0,
+        "present_days": 0,
+        "total_work_hours": 0,
+        "average_work_hours": None,
+        "total_late_minutes": 0,
+        "total_overtime_minutes": 0
+    }
+
+    return {
+        "emp_code": employee["emp_code"],
+        "name": employee.get("name"),
+        "department": employee.get("department"),
+        "month": month,
+        **summary
+    }
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
