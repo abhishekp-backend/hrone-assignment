@@ -352,6 +352,330 @@ def list_attendance(
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
 
+@app.get("/analytics/leaderboard/late")
+def late_comers_leaderboard(
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+):
+    match_stage = {"late_minutes": {"$gt": 0}}
+
+    if date_from or date_to:
+        match_stage["date"] = {}
+
+        if date_from:
+            try:
+                datetime.strptime(date_from, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="date_from must use YYYY-MM-DD format",
+                )
+            match_stage["date"]["$gte"] = date_from
+
+        if date_to:
+            try:
+                datetime.strptime(date_to, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail="date_to must use YYYY-MM-DD format",
+                )
+            match_stage["date"]["$lte"] = date_to
+
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(
+                status_code=400,
+                detail="date_from cannot be after date_to",
+            )
+
+    pipeline = [
+        # 1. Include only attendance records with positive lateness.
+        {"$match": match_stage},
+
+        # 2. Calculate total late minutes and late-day count per employee.
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_days": {"$sum": 1},
+            }
+        },
+
+        # 3. Rank employees by total lateness.
+        # Equal totals receive equal ranks; subsequent ranks are skipped.
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {"$rank": {}}
+                },
+            }
+        },
+
+        # 4. Retrieve employee details.
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "employee",
+            }
+        },
+
+        # 5. Shape the response.
+        {
+            "$project": {
+                "_id": 0,
+                "emp_code": "$_id",
+                "name": {
+                    "$arrayElemAt": ["$employee.name", 0]
+                },
+                "department": {
+                    "$arrayElemAt": ["$employee.department", 0]
+                },
+                "total_late_minutes": 1,
+                "late_days": 1,
+                "rank": 1,
+            }
+        },
+
+        {"$sort": {"total_late_minutes": -1}}
+    ]
+
+    results = list(db.attendance_logs.aggregate(pipeline))
+
+    return {
+        "count": len(results),
+        "items": results,
+    }
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str):
+    """
+    Monthly department summary.
+    month format: YYYY-MM
+    """
+
+    # Validate the requested month.
+    try:
+        month_start = datetime.strptime(month, "%Y-%m")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="month must be in YYYY-MM format",
+        )
+
+    if month_start.strftime("%Y-%m") != month:
+        raise HTTPException(
+            status_code=422,
+            detail="month must be in YYYY-MM format",
+        )
+
+    next_month = (
+            month_start.replace(day=28) + timedelta(days=4)
+    ).replace(day=1)
+
+    month_start_str = month_start.strftime("%Y-%m-%d")
+    next_month_str = next_month.strftime("%Y-%m-%d")
+
+    pipeline = [
+        # Include employees who have joined by the end of this month.
+        {
+            "$match": {
+                "joined_on": {"$lt": next_month_str}
+            }
+        },
+
+        # Find each employee's attendance records for the month.
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"employee_code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {
+                                        "$eq": [
+                                            "$emp_code",
+                                            "$$employee_code",
+                                        ]
+                                    },
+                                    {
+                                        "$gte": [
+                                            "$date",
+                                            month_start_str,
+                                        ]
+                                    },
+                                    {
+                                        "$lt": [
+                                            "$date",
+                                            next_month_str,
+                                        ]
+                                    },
+                                ]
+                            }
+                        }
+                    }
+                ],
+                "as": "attendance",
+            }
+        },
+
+        # Keep employees even when they have no attendance records.
+        {
+            "$unwind": {
+                "path": "$attendance",
+                "preserveNullAndEmptyArrays": True,
+            }
+        },
+
+        # Aggregate per employee first, preserving one headcount per person.
+        {
+            "$group": {
+                "_id": {
+                    "department": "$department",
+                    "emp_code": "$emp_code",
+                },
+                "attendance_records": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$ne": [
+                                    {"$ifNull": ["$attendance.date", None]},
+                                    None,
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$in": [
+                                    "$attendance.status",
+                                    ["PRESENT", "WFH", "ON_DUTY"],
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": ["$attendance.half_day", True]},
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {
+                        "$ifNull": ["$attendance.late_minutes", 0]
+                    }
+                },
+                "total_overtime_minutes": {
+                    "$sum": {
+                        "$ifNull": ["$attendance.overtime_minutes", 0]
+                    }
+                },
+                "work_hours_sum": {
+                    "$sum": {
+                        "$ifNull": ["$attendance.work_hours", 0]
+                    }
+                },
+                "work_hours_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$ne": ["$attendance.work_hours", None]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+
+        # Aggregate employee metrics by department.
+        {
+            "$group": {
+                "_id": "$_id.department",
+                "headcount": {"$sum": 1},
+                "attendance_records": {"$sum": "$attendance_records"},
+                "present_days": {"$sum": "$present_days"},
+                "total_late_minutes": {"$sum": "$total_late_minutes"},
+                "total_overtime_minutes": {
+                    "$sum": "$total_overtime_minutes"
+                },
+                "work_hours_sum": {"$sum": "$work_hours_sum"},
+                "work_hours_count": {"$sum": "$work_hours_count"},
+            }
+        },
+
+        # Average across attendance records, not employee averages.
+        {
+            "$project": {
+                "_id": 0,
+                "department": "$_id",
+                "headcount": 1,
+                "attendance_records": 1,
+                "present_days": 1,
+                "total_late_minutes": 1,
+                "total_overtime_minutes": 1,
+                "average_work_hours": {
+                    "$cond": [
+                        {"$gt": ["$work_hours_count", 0]},
+                        {
+                            "$round": [
+                                {
+                                    "$divide": [
+                                        "$work_hours_sum",
+                                        "$work_hours_count",
+                                    ]
+                                },
+                                2,
+                            ]
+                        },
+                        None,
+                    ]
+                },
+            }
+        },
+
+        {"$sort": {"department": 1}},
+    ]
+
+    items = list(db.employees.aggregate(pipeline))
+
+    return {
+        "month": month,
+        "count": len(items),
+        "items": items,
+    }
+
+
+@app.get("/attendance/{emp_code}/{date}/history")
+def get_attendance_history(emp_code: str, date: str):
+    # Find the attendance record for this employee on this date
+    record = db.attendance_logs.find_one(
+        {"emp_code": emp_code, "date": date},
+        {"_id": 0, "emp_code": 1, "date": 1, "history": 1}
+    )
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Attendance record not found"
+        )
+
+    return {
+        "emp_code": record["emp_code"],
+        "date": record["date"],
+        "history": record.get("history", [])
+    }
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
