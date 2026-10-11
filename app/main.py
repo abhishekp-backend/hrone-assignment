@@ -1019,6 +1019,214 @@ def employee_monthly_summary(emp_code: str, month: str):
         **summary
     }
 
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+        department: str,
+        date_from: str,
+        date_to: str
+):
+    # 1. Validate the date range
+    try:
+        start = datetime.strptime(date_from, "%Y-%m-%d")
+        end = datetime.strptime(date_to, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail="Dates must use YYYY-MM-DD format"
+        )
+
+    if (
+            start.strftime("%Y-%m-%d") != date_from
+            or end.strftime("%Y-%m-%d") != date_to
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Dates must use YYYY-MM-DD format"
+        )
+
+    if start > end:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from must be on or before date_to"
+        )
+
+    # 2. Check that the department exists
+    if db.employees.count_documents({"department": department}) == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Department not found"
+        )
+
+    # 3. Aggregate daily attendance for employees in this department
+    pipeline = [
+        {
+            "$match": {
+                "department": department
+            }
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"employee_code": "$emp_code"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {
+                                        "$eq": [
+                                            "$emp_code",
+                                            "$$employee_code"
+                                        ]
+                                    },
+                                    {"$gte": ["$date", date_from]},
+                                    {
+                                        "$lte": [
+                                            "$date",
+                                            date_to
+                                        ]
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$addFields": {
+                            "day": {
+                                "$dateFromString": {
+                                    "dateString": "$date",
+                                    "format": "%Y-%m-%d",
+                                    "timezone": "Asia/Kolkata"
+                                }
+                            },
+                            "normalized_status": {
+                                "$toUpper": {
+                                    "$ifNull": ["$status", ""]
+                                }
+                            }
+                        }
+                    }
+                ],
+                "as": "logs"
+            }
+        },
+        {"$unwind": "$logs"},
+        {
+            "$group": {
+                "_id": "$logs.day",
+                "attendance_records": {"$sum": 1},
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$in": [
+                                    "$logs.normalized_status",
+                                    ["PRESENT", "WFH", "ON_DUTY"]
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": ["$logs.half_day", True]},
+                                    0.5,
+                                    1
+                                ]
+                            },
+                            0
+                        ]
+                    }
+                },
+                "late_minutes": {
+                    "$sum": {
+                        "$ifNull": ["$logs.late_minutes", 0]
+                    }
+                },
+                "overtime_minutes": {
+                    "$sum": {
+                        "$ifNull": ["$logs.overtime_minutes", 0]
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "day": "$_id",
+                "attendance_records": 1,
+                "present_days": 1,
+                "late_minutes": 1,
+                "overtime_minutes": 1
+            }
+        },
+        {"$sort": {"day": 1}},
+        {
+            "$densify": {
+                "field": "day",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [
+                        start,
+                        datetime.fromordinal(end.toordinal() + 1)
+                    ]
+                }
+            }
+        },
+        {
+            "$fill": {
+                "output": {
+                    "attendance_records": {"value": 0},
+                    "present_days": {"value": 0},
+                    "late_minutes": {"value": 0},
+                    "overtime_minutes": {"value": 0}
+                }
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"day": 1},
+                "output": {
+                    "moving_average_7d": {
+                        "$avg": "$present_days",
+                        "window": {
+                            "range": [-6, 0],
+                            "unit": "day"
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": {
+                    "$dateToString": {
+                        "format": "%Y-%m-%d",
+                        "date": "$day",
+                        "timezone": "Asia/Kolkata"
+                    }
+                },
+                "attendance_records": 1,
+                "present_days": 1,
+                "late_minutes": 1,
+                "overtime_minutes": 1,
+                "moving_average_7d": {
+                    "$round": ["$moving_average_7d", 2]
+                }
+            }
+        },
+        {"$sort": {"date": 1}}
+    ]
+
+    items = list(db.employees.aggregate(pipeline))
+
+    return {
+        "department": department,
+        "date_from": date_from,
+        "date_to": date_to,
+        "count": len(items),
+        "items": items
+    }
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
