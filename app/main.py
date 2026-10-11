@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from pymongo.errors import PyMongoError, DuplicateKeyError
+from pymongo import ASCENDING, DESCENDING
 from pydantic import BaseModel
 from pymongo import MongoClient
 
@@ -1370,6 +1371,64 @@ def department_trend(
         "count": len(items),
         "items": items
     }
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(endpoint: str):
+    # Map endpoint names to the actual MongoDB queries
+    # used by your application.
+    queries = {
+        "attendance": (
+            db.attendance_logs,
+            {"emp_code": "EMP001"},
+            [("date", DESCENDING)],
+        ),
+        "punch-in": (
+            db.attendance_logs,
+            {"emp_code": "EMP001", "date": "2026-10-11"},
+            [],
+        ),
+        "punch-out": (
+            db.attendance_logs,
+            {"emp_code": "EMP001", "date": "2026-10-11"},
+            [],
+        ),
+    }
+
+    if endpoint not in queries:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Unsupported endpoint",
+                "supported": list(queries.keys()),
+            },
+        )
+
+    collection, query, sort = queries[endpoint]
+
+    cursor = collection.find(query)
+
+    if sort:
+        cursor = cursor.sort(sort)
+
+    plan = db.command(
+        "explain",
+        {
+            "find": collection.name,
+            "filter": query,
+            **({"sort": dict(sort)} if sort else {}),
+        },
+        verbosity="executionStats",
+    )
+
+    return {
+        "endpoint": endpoint,
+        "collection": collection.name,
+        "query": query,
+        "executionStats": plan.get("executionStats", {}),
+        "queryPlanner": plan.get("queryPlanner", {}),
+    }
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
