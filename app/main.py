@@ -604,7 +604,7 @@ def late_comers_leaderboard(
             }
         },
 
-        {"$sort": {"total_late_minutes": -1}}
+        {"$sort": {"total_late_minutes": -1, "emp_code": 1}}
     ]
 
     results = list(db.attendance_logs.aggregate(pipeline))
